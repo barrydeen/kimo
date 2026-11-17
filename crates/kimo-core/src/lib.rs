@@ -65,6 +65,7 @@ pub mod text;
 pub mod recipes;
 pub mod particles;
 pub mod gpu2d;
+pub mod hw;
 pub mod titles;
 pub mod transitions;
 pub mod audio;

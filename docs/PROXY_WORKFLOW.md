@@ -27,11 +27,12 @@ Windows:
 
 - An **edit proxy**: an intra-frame H.264 MP4, long side 1280, exact aspect ratio,
   never upscaled, CRF 23, no audio. It has the same fidelity rules as
-  `proxy_generate`: opaque 8-bit SDR, square pixels, zero start, verified constant
-  frame rate. Every output timestamp, the frame count and the size are checked
-  before publication, and the source is stat-checked again afterwards. Sources
-  that fail these rules (variable frame rate, HDR, alpha, rotation) or are already
-  no larger than 1280 get no edit proxy; the job's `note` says why.
+  `proxy_generate`: opaque 8-bit SDR or 10-bit HLG/PQ camera video, square pixels,
+  zero start, verified constant or honestly variable frame rate. Every output
+  timestamp, the frame count and the size are checked before publication, and the
+  source is stat-checked again afterwards. Sources that fail these rules (alpha,
+  rotation, other HDR) or are already no larger than 1280 get no edit proxy; the
+  job's `note` says why.
 - An **analysis proxy** (`analysis_proxy.rs`, short GOP) when keyframes are sparse,
   so analysis and draft renders find it ready instead of starting it on first use.
   The import-time build and any on-demand build share one in-flight set, so the
@@ -119,19 +120,43 @@ cache contamination. Nested compositions carry the proxy table too.
 
 ## Fidelity and file lifecycle
 
-Generation supports opaque 8-bit SDR video with square pixels, zero start time,
-no display rotation, and verified constant frame rate from 1 to 240 fps.
-Every decoded source timestamp is checked against the rational rate, then the
-output frame count, timestamps, dimensions and rate are checked again. The limit
-is 216,000 frames and a 32 MiB probe response. Unsupported media is refused;
-there is no silent variable-frame-rate conversion, HDR conversion or alpha loss.
-The proxy is an intra-frame H.264 MP4 without audio, using CRF 23. Dimensions
-preserve the exact source aspect ratio, stay within `max_side` (default 960,
-64–4096) and never upscale. Some unusual aspect ratios need a larger bound.
-Proxies are lossy editing aids, so they are unsuitable for final color or
-pixel-critical assessment. Smaller decode inputs can reduce source decoding
-work; the compositor still runs at project resolution. No speedup is claimed
-without measuring the user's footage and hardware.
+Generation supports opaque 8-bit SDR video and 10-bit HLG/PQ camera video (the
+shape of every phone "HDR" clip) with square pixels, zero start time, no display
+rotation, and frame rates from 1 to 240 fps. Constant-rate sources are verified
+against the rational rate grid; variable-rate sources are verified to have
+strictly increasing timestamps with no stall over a second, and are encoded with
+`-fps_mode passthrough` so the proxy holds exactly the source's frame sequence —
+a CFR resample would duplicate or drop frames and shift every later one, and the
+renderer maps time to frame ordinals. Rate tags are validated by value, not by
+numerator size: a VFR phone file reports `avg_frame_rate` as a raw timebase
+rational (e.g. 25110000/835459), which is an mp4 timescale artifact, not a rate
+problem. 10-bit HLG/PQ sources are encoded to 8-bit with the source's color range,
+matrix, primaries and transfer re-declared on the proxy, so a decode that honors
+stream metadata renders it like the original (measured on 4K Pixel footage:
+mean channel delta 2.9/255, pure quantization). The output frame count, rate,
+dimensions and rate tags are checked again. The limit is 216,000 frames and a
+32 MiB probe response. Unsupported media is still refused; there is no silent
+variable-frame-rate conversion, HDR tone mapping or alpha loss. The proxy is an
+intra-frame H.264 MP4 without audio, CRF 23 (NVENC: `-g 0` — gopLength 0 means
+every frame intra; NVENC SDK 12.2+ rejects `-g 1`). Dimensions preserve the exact
+source aspect ratio, stay within `max_side` (default 960, 64–4096) and never
+upscale. Some unusual aspect ratios need a larger bound. Proxies are lossy
+editing aids, so they are unsuitable for final color or pixel-critical
+assessment. Smaller decode inputs can reduce source decoding work; the
+compositor still runs at project resolution. No speedup is claimed without
+measuring the user's footage and hardware.
+
+Timestamp scans are two-stage (`proxy::inspect`): a header-only ffprobe
+(milliseconds) picks the scan, because a decoded-frame scan of 4K HEVC takes
+minutes on one core and used to freeze every proxy build behind it. Streams
+without B-frames — every camera/phone file and every proxy this module writes —
+have packet pts in presentation order already, so the scan demuxes without
+decoding (measured 0.17 s on a 42 Mbps 4K HEVC clip, versus minutes). B-frame
+streams reorder, so those (and any stream that does not say) scan decoded frames,
+multithreaded (`-threads 0`; ffprobe decodes on one thread by default).
+`analysis_proxy::max_keyframe_gap` reads keyframe positions from packet flags on
+the same grounds: the packet scan and the decoded scan it replaced agree to
+under 0.05 s on real footage.
 
 The destination must be a new `.mp4` file in an existing directory. A uniquely
 reserved sibling temporary file is encoded under a deadline with cooperative

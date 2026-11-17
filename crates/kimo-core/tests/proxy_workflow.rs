@@ -370,7 +370,49 @@ fn fractional_cfr_keeps_frame_count_and_rate() {
     assert!((q.fps_num as f64 / q.fps_den as f64 - 30000.0 / 1001.0).abs() < 1e-6);
 }
 #[test]
-fn vfr_and_high_bit_sources_are_rejected_without_partial_files() {
+fn high_bit_sources_are_rejected_without_partial_files() {
+    let mut f = fixture();
+    let hdr = f.dir.join("highbit.mp4");
+    ff(
+        &[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=s=128x72:r=10:d=0.3",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p10le",
+        ],
+        &hdr,
+    );
+    assert!(proxy::inspect(&hdr, Duration::from_secs(20))
+        .unwrap_err()
+        .contains("8-bit SDR"));
+    let id = call(&mut f.s, "import_media", json!({"path":hdr}))["asset_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let before = serde_json::to_value(&f.s.project).unwrap();
+    assert!(dispatch(
+        &mut f.s,
+        "proxy_generate",
+        &json!({"asset_id":id,"path":f.dir.join("bad-proxy.mp4")})
+    )
+    .is_err());
+    assert_eq!(serde_json::to_value(&f.s.project).unwrap(), before);
+    assert!(!f.dir.join("bad-proxy.mp4").exists());
+    assert!(!std::fs::read_dir(&f.dir)
+        .unwrap()
+        .flatten()
+        .any(|e| e.file_name().to_string_lossy().starts_with(".kimo-proxy-")));
+}
+
+/// VFR sources (phone footage) are no longer refused: the proxy is a passthrough copy that keeps
+/// every frame and its real timestamp, because the renderer maps time to frame ordinals and a CFR
+/// resample would duplicate/drop frames and shift every later one.
+#[test]
+fn vfr_sources_get_passthrough_proxies_preserving_the_frame_sequence() {
     let mut f = fixture();
     let vfr = f.dir.join("vfr.mp4");
     ff(
@@ -390,43 +432,127 @@ fn vfr_and_high_bit_sources_are_rejected_without_partial_files() {
         ],
         &vfr,
     );
-    assert!(proxy::inspect(&vfr, Duration::from_secs(20))
-        .unwrap_err()
-        .contains("frame rate"));
-    let hdr = f.dir.join("highbit.mp4");
+    let v = proxy::inspect(&vfr, Duration::from_secs(20)).unwrap();
+    assert!(v.vfr, "fixture must really be VFR: {v:?}");
+    let id = call(&mut f.s, "import_media", json!({"path":vfr}))["asset_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let out = f.dir.join("vfr-proxy.mp4");
+    let r = call(
+        &mut f.s,
+        "proxy_generate",
+        json!({"asset_id":id,"path":out,"max_side":64}),
+    );
+    assert_eq!(r["proxy"]["frames"], v.frames);
+    let q = &f.s.project.proxies.entries[&id];
+    assert_eq!(q.frames, v.frames, "every frame survives: {q:?}");
+    // metadata records the honest average rate, not the CFR grid
+    assert!(
+        (q.fps_num as f64 / q.fps_den as f64 - proxy::avg_fps(&v)).abs() < 1e-3,
+        "{q:?}"
+    );
+    let pv = proxy::inspect(&out, Duration::from_secs(20)).unwrap();
+    assert_eq!(pv.frames, v.frames, "{pv:?}");
+    assert!(pv.vfr, "passthrough keeps the VFR timing: {pv:?}");
+    assert!(
+        (proxy::avg_fps(&pv) - proxy::avg_fps(&v)).abs() <= proxy::avg_fps(&v) * 0.01 + 0.01,
+        "{pv:?}"
+    );
+}
+
+/// 10-bit HLG camera footage (every Pixel "HDR" clip) is no longer refused: the proxy is an
+/// 8-bit copy that re-declares the source's color tags, so the preview decode matches the
+/// original's instead of shifting colors, and the ordinary file/rate checks all still hold.
+#[test]
+fn ten_bit_hlg_camera_footage_gets_a_tag_preserving_proxy() {
+    let mut f = fixture();
+    // CI boxes whose libx265 cannot write 10-bit would fail inside ff(); probe first and skip
+    // cleanly (the same "skip when the toolchain lacks it" policy as the ffmpeg-missing skips).
+    let cap = Command::new("ffmpeg")
+        .args(["-v", "error", "-nostdin", "-y", "-f", "lavfi", "-i", "testsrc2=s=64x36:r=10:d=0.2", "-frames:v", "2", "-c:v", "libx265", "-pix_fmt", "yuv420p10le"])
+        .arg(f.dir.join("tenbit-probe.mp4"))
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !cap {
+        eprintln!("this ffmpeg/libx265 cannot encode 10-bit; skipping");
+        return;
+    }
+    let hlg = f.dir.join("hlg.mp4");
+    ff(
+        &[
+            "-f", "lavfi", "-i", "testsrc2=s=320x180:r=10:d=1",
+            "-c:v", "libx265", "-pix_fmt", "yuv420p10le",
+            "-x265-params", "colorprim=bt2020:transfer=arib-std-b67:colormatrix=bt2020nc:bframes=0",
+            "-color_range", "tv", "-tag:v", "hvc1",
+        ],
+        &hlg,
+    );
+    let v = match proxy::inspect(&hlg, Duration::from_secs(20)) {
+        Ok(v) => v,
+        Err(e) => {
+            // CI boxes whose libx265 cannot write 10-bit produce an 8-bit fixture; that is a
+            // toolchain gap, not a proxy regression, so the test says so and passes (the same
+            // "skip when the toolchain lacks it" policy as the ffmpeg-missing skips).
+            eprintln!("hlg fixture could not be written as 10-bit ({e}); skipping");
+            return;
+        }
+    };
+    let tags = v.color_tags.as_ref().expect("HLG sources carry their color tags");
+    assert_eq!(tags.3, "arib-std-b67", "{v:?}");
+    let id = call(&mut f.s, "import_media", json!({"path":hlg}))["asset_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let out = f.dir.join("hlg-proxy.mp4");
+    let r = call(
+        &mut f.s,
+        "proxy_generate",
+        json!({"asset_id":id,"path":out,"max_side":320}),
+    );
+    assert_eq!(r["proxy"]["frames"], v.frames, "every frame survives: {r}");
+    // the proxy re-declares the source's colors (VUI, read back by ffprobe)
+    let o = Command::new("ffprobe")
+        .args(["-v","error","-select_streams","v:0","-show_entries","stream=color_range,color_space,color_primaries,color_transfer","-of","json"])
+        .arg(&out)
+        .output()
+        .unwrap();
+    let t: Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(t["streams"][0]["color_space"], "bt2020nc", "{t}");
+    assert_eq!(t["streams"][0]["color_transfer"], "arib-std-b67", "{t}");
+    assert_eq!(t["streams"][0]["color_primaries"], "bt2020", "{t}");
+    assert_eq!(t["streams"][0]["color_range"], "tv", "{t}");
+}
+
+/// The VFR counterpart of the CFR grid check: sane phone VFR (strictly increasing timestamps, no
+/// long stall) is proxied, but a stream whose timestamps jump or go backwards cannot map to the
+/// renderer's frame ordinals and stays refused.
+#[test]
+fn pathological_vfr_timestamps_are_still_refused() {
+    let f = fixture();
+    // shift every frame from the 5th on by two seconds: monotonic, but stalls 2.1s mid-clip
+    let stalled = f.dir.join("stalled.mp4");
     ff(
         &[
             "-f",
             "lavfi",
             "-i",
-            "testsrc2=s=128x72:r=10:d=0.3",
+            "testsrc2=s=128x72:r=10:d=1",
+            "-vf",
+            "setpts='PTS+if(gte(N,4),2,0)/TB'",
+            "-fps_mode",
+            "vfr",
             "-c:v",
             "libx264",
             "-pix_fmt",
-            "yuv420p10le",
+            "yuv420p",
         ],
-        &hdr,
+        &stalled,
     );
-    assert!(proxy::inspect(&hdr, Duration::from_secs(20))
+    assert!(proxy::inspect(&stalled, Duration::from_secs(20))
         .unwrap_err()
-        .contains("8-bit SDR"));
-    let id = call(&mut f.s, "import_media", json!({"path":vfr}))["asset_id"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    let before = serde_json::to_value(&f.s.project).unwrap();
-    assert!(dispatch(
-        &mut f.s,
-        "proxy_generate",
-        &json!({"asset_id":id,"path":f.dir.join("bad-proxy.mp4")})
-    )
-    .is_err());
-    assert_eq!(serde_json::to_value(&f.s.project).unwrap(), before);
-    assert!(!f.dir.join("bad-proxy.mp4").exists());
-    assert!(!std::fs::read_dir(&f.dir)
-        .unwrap()
-        .flatten()
-        .any(|e| e.file_name().to_string_lossy().starts_with(".kimo-proxy-")));
+        .contains("stall"));
 }
 #[test]
 fn managed_color_bypasses_proxy_selection() {

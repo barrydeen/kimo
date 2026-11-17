@@ -474,17 +474,55 @@ fn build_edit(t: &Task, progress: &mut dyn FnMut(f64)) -> Result<String, EditErr
     std::fs::create_dir_all(dir).map_err(|e| Failed(format!("proxy cache folder: {e}")))?;
     let tmp = file.with_extension("mp4.part");
     let _ = std::fs::remove_file(&tmp);
-    let mut cmd = Command::new("ffmpeg");
-    cmd.args(["-v", "error", "-nostdin", "-y"]).args(PROGRESS_ARGS).args(["-noautorotate", "-i"]).arg(src).args([
-        "-map", "0:v:0", "-an", "-sn", "-dn", "-map_metadata", "-1",
-        "-vf", &format!("scale={w}:{h}:flags=fast_bilinear,setsar=1"),
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-g", "1", "-bf", "0", "-pix_fmt", "yuv420p",
-        "-r", &format!("{}/{}", v.num, v.den), "-fps_mode", "cfr", "-video_track_timescale", &v.num.to_string(), "-f", "mp4",
-    ]).arg(&tmp);
-    let done = (|| {
-        run_ffmpeg(&mut cmd, Measure::Frames(v.frames as u64), progress)?;
+    // Hardware decode/encode when the GPU answers; the software branch keeps the historical argv
+    // byte-identical (with KIMO_HWACCEL=off, no GPU, or after a failed hardware attempt below).
+    let hw_decode = crate::hw::nvdec_available() && (v.codec == "h264" || v.codec == "hevc");
+    let nvenc = crate::hw::nvenc_available();
+    // VFR sources (phone footage) keep every frame and its real timestamp: the renderer maps time
+    // to frame ordinals, so the proxy must hold the same frame sequence -- a CFR resample would
+    // duplicate/drop frames and shift every later one. CFR sources keep the historical grid.
+    let (fps_num, fps_den) = if v.vfr { (v.avg_num, v.avg_den) } else { (v.num, v.den) };
+    let command = |hw: bool| -> Command {
+        let mut cmd = Command::new("ffmpeg");
+        cmd.args(["-v", "error", "-nostdin", "-y"]).args(PROGRESS_ARGS);
+        if hw {
+            cmd.args(["-hwaccel", "cuda"]);
+        }
+        cmd.args(["-noautorotate", "-i"]).arg(src).args([
+            "-map", "0:v:0", "-an", "-sn", "-dn", "-map_metadata", "-1",
+            "-vf", &format!("scale={w}:{h}:flags=fast_bilinear,setsar=1"),
+        ]);
+        if nvenc {
+            // NVENC all-intra is `-g 0` (gopLength 0 = every frame intra; `-g 1` is rejected by
+            // SDK 12.2+: "Gop Length should be greater than number of B frames + 1").
+            cmd.args(["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "23", "-b:v", "0", "-g", "0", "-bf", "0", "-pix_fmt", "yuv420p"]);
+        } else {
+            cmd.args(["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-g", "1", "-bf", "0", "-pix_fmt", "yuv420p"]);
+        }
+        // 10-bit HLG/PQ sources: re-declare the source's color tags on the 8-bit proxy.
+        if let Some(t) = &v.color_tags { crate::proxy::color_args(&mut cmd, t); }
+        if v.vfr {
+            cmd.args(["-fps_mode", "passthrough", "-video_track_timescale", "90000", "-f", "mp4"]);
+        } else {
+            cmd.args(["-r", &format!("{}/{}", v.num, v.den), "-fps_mode", "cfr", "-video_track_timescale", &v.num.to_string(), "-f", "mp4"]);
+        }
+        cmd.arg(&tmp);
+        cmd
+    };
+    let done = (|| -> Result<(), String> {
+        let attempt = run_ffmpeg(&mut command(hw_decode), Measure::Frames(v.frames as u64), progress);
+        if attempt.is_err() && hw_decode {
+            run_ffmpeg(&mut command(false), Measure::Frames(v.frames as u64), progress)?;
+        } else {
+            attempt?;
+        }
         let e = crate::proxy::inspect(&tmp, INSPECT_TIMEOUT)?;
-        if e.frames != v.frames || e.width != w || e.height != h || (e.num as f64 / e.den as f64 - v.num as f64 / v.den as f64).abs() > 1e-6 {
+        let rate_ok = if v.vfr {
+            (crate::proxy::avg_fps(&e) - crate::proxy::avg_fps(&v)).abs() <= crate::proxy::avg_fps(&v) * 0.01 + 0.01
+        } else {
+            (e.num as f64 / e.den as f64 - v.num as f64 / v.den as f64).abs() <= 1e-6
+        };
+        if e.frames != v.frames || e.width != w || e.height != h || !rate_ok {
             return Err("the encoded proxy failed its frame-count/rate/size check".to_string());
         }
         if crate::proxy::stamp(src)? != before {
@@ -492,7 +530,7 @@ fn build_edit(t: &Task, progress: &mut dyn FnMut(f64)) -> Result<String, EditErr
         }
         std::fs::rename(&tmp, &file).map_err(|e| e.to_string())?;
         let bytes = crate::proxy::stamp(&file)?.bytes;
-        let side = json!({"source_key": key, "bytes": bytes, "source_width": v.width, "source_height": v.height, "width": w, "height": h, "frames": v.frames, "fps_num": v.num, "fps_den": v.den});
+        let side = json!({"source_key": key, "bytes": bytes, "source_width": v.width, "source_height": v.height, "width": w, "height": h, "frames": v.frames, "fps_num": fps_num, "fps_den": fps_den});
         std::fs::write(file.with_extension("json"), side.to_string()).map_err(|e| e.to_string())
     })();
     if let Err(e) = done {

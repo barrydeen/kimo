@@ -1,3 +1,33 @@
+## Unreleased
+
+**Engine**
+- Proxies accept real phone footage. Rate tags are validated by value (a VFR file's `avg_frame_rate`
+  is a raw timebase rational like 25110000/835459 -- the old numerator cap rejected exactly that);
+  variable-frame-rate sources get `-fps_mode passthrough` proxies that preserve the frame sequence
+  (the renderer maps time to frame ordinals, so a CFR resample would shift every later frame); and
+  10-bit HLG/PQ camera video is proxied to 8-bit with the source's color tags re-declared, so the
+  preview decode matches the original (measured on 4K Pixel footage: mean channel delta 2.9/255).
+  Pathological VFR (nonmonotonic or stalling timestamps) is still refused.
+- Proxy timestamp scans no longer decode the whole file. A header-only ffprobe picks the scan:
+  streams without B-frames (all camera/phone footage, and every proxy kimo writes) demux packets
+  instead -- measured 0.17 s on a 42 Mbps 4K HEVC clip versus minutes on one core, which used to
+  freeze every proxy job behind it. B-frame streams still scan decoded frames, multithreaded
+  (`ffprobe` decodes on one thread by default). `analysis_proxy::max_keyframe_gap` reads packet
+  flags on the same grounds; the packet and decoded scans agree to under 0.05 s on real footage.
+- NVIDIA NVDEC/NVENC offload for the ffmpeg stages (`src/hw.rs`), discovered at runtime with real
+  encode/decode probes that fail closed. Proxy builds decode h264/hevc through NVDEC and encode
+  through NVENC automatically when the probe passes (all-intra is `-g 0`; NVENC SDK 12.2+ rejects
+  `-g 1`), ordinary exports switch to `h264_nvenc` only when `KIMO_ENCODER=nvenc` is set, and every
+  hardware attempt retries once, all-software, on any failure. `KIMO_HWACCEL=off` disables all of
+  it; unset, the export argv is byte-identical to before. Measured on an RTX 3090: a 146 MB 4K
+  HEVC clip's edit proxy builds in 5.4 s end to end.
+
+**Desktop app**
+- Fixed a startup crash on NVIDIA + Wayland: webkit2gtk's DMABUF renderer dies with a Wayland
+  protocol error 71, so the app sets `WEBKIT_DISABLE_DMABUF_RENDERER=1` itself when a Wayland
+  session and the NVIDIA driver are present. An explicitly set user value always wins; AMD/Intel
+  Wayland and X11 sessions are untouched.
+
 ## v9.0.0 "the app" (2026-11-14)
 
 kimo 9 makes the desktop app the main download: the editor, the engine and your agents in one window, on Windows and

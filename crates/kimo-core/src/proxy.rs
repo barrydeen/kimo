@@ -161,7 +161,23 @@ pub struct Video {
     pub num: u32,
     pub den: u32,
     pub frames: usize,
+    /// avg_frame_rate, reduced. Equals num/den for CFR sources; phone footage is often VFR and this
+    /// is the honest average (a big-numerator rational like 25110000/835459 is a timebase artifact,
+    /// not a rate problem -- the VALUE is what matters, see inspect).
+    pub avg_num: u32,
+    pub avg_den: u32,
+    /// True when r_frame_rate and avg_frame_rate disagree (variable frame rate). VFR sources get
+    /// passthrough proxies that keep every frame ordinal; callers choose the build path with this.
+    pub vfr: bool,
+    /// First video stream's codec name, lowercase ("" when unknown).
+    pub codec: String,
+    /// Some((range, matrix, primaries, transfer)) for HLG/PQ camera HDR (10-bit Pixel/iPhone
+    /// "HDR" footage): the proxy is encoded 8-bit but re-declares these exact color tags, so any
+    /// decode that honors stream metadata renders the proxy like the original (quantization
+    /// aside). None for SDR sources, whose argv stays byte-identical to before.
+    pub color_tags: Option<(String, String, String, String)>,
 }
+pub fn avg_fps(v: &Video) -> f64 { v.avg_num as f64 / v.avg_den as f64 }
 fn number(v: &Value, key: &str) -> Result<f64, String> {
     v[key]
         .as_str()
@@ -170,38 +186,52 @@ fn number(v: &Value, key: &str) -> Result<f64, String> {
         .filter(|n| n.is_finite())
         .ok_or_else(|| format!("missing video {key}"))
 }
-/// Inspect every decoded timestamp rather than guessing CFR from container rate tags.
+/// Inspect every timestamp rather than guessing CFR from container rate tags.
+///
+/// Rate tags are validated by VALUE (1..240 fps): a VFR phone file reports avg_frame_rate as a raw
+/// timebase rational (e.g. 25110000/835459 = 30.05 fps), and the old numerator cap rejected exactly
+/// that footage. VFR itself is no longer a rejection here -- it is reported in `vfr` and the proxy
+/// builders respond with a passthrough proxy that preserves the frame sequence.
+///
+/// The scan is two-stage because a decoded-frame scan of 4K HEVC takes minutes on one core, which
+/// froze every proxy build behind it. Stage one is header-only (milliseconds) and picks the scan:
+/// streams without B-frames -- every camera/phone file, and every proxy this module writes (intra,
+/// bf 0) -- have packet pts in presentation order already, so stage two demuxes without decoding
+/// (measured 0.17 s on a 42 Mbps 4K HEVC clip). B-frame streams reorder, so for those (and any
+/// stream that does not say) stage two scans decoded frames, multithreaded: ffprobe decodes on one
+/// thread unless told otherwise.
 pub fn inspect(path: &Path, timeout: Duration) -> Result<Video, String> {
-    let bytes = crate::color::process::decode_capture(Command::new("ffprobe").args(["-v","error","-select_streams","v:0","-show_entries",
-        "stream=width,height,r_frame_rate,avg_frame_rate,start_time,pix_fmt,sample_aspect_ratio,color_transfer:stream_tags=rotate:stream_side_data=rotation:stream_disposition=attached_pic:frame=best_effort_timestamp_time",
-        "-of","json"]).arg(path), 32 << 20, timeout)?;
-    let data: Value = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-    let s = data["streams"]
+    let probe = |entries: &str, threads: bool| -> Result<Value, String> {
+        let mut cmd = Command::new("ffprobe");
+        cmd.args(["-v", "error", "-select_streams", "v:0"]);
+        if threads { cmd.args(["-threads", "0"]); }
+        cmd.args(["-show_entries", entries, "-of", "json"]).arg(path);
+        let bytes = crate::color::process::decode_capture(&mut cmd, 32 << 20, timeout)?;
+        serde_json::from_slice(&bytes).map_err(|e| e.to_string())
+    };
+    let s = probe("stream=codec_name,width,height,r_frame_rate,avg_frame_rate,start_time,pix_fmt,sample_aspect_ratio,color_transfer,has_b_frames:stream_tags=rotate:stream_side_data=rotation:stream_disposition=attached_pic", false)?["streams"]
         .as_array()
         .and_then(|a| a.first())
+        .cloned()
         .ok_or("proxy requires a video stream")?;
-    let rate = |key: &str| -> Result<(u32, u32), String> {
+    let rate = |key: &str| -> Result<(u64, u64), String> {
         let (n, d) = s[key]
             .as_str()
             .and_then(|x| x.split_once('/'))
             .ok_or("missing rational video rate")?;
         let (n, d) = (
-            n.parse::<u32>().map_err(|e| e.to_string())?,
-            d.parse::<u32>().map_err(|e| e.to_string())?,
+            n.parse::<u64>().map_err(|e| e.to_string())?,
+            d.parse::<u64>().map_err(|e| e.to_string())?,
         );
-        if n == 0 || d == 0 || n > 1_000_000 || !(1.0..=240.0).contains(&(n as f64 / d as f64)) {
+        if n == 0 || d == 0 || !(1.0..=240.0).contains(&(n as f64 / d as f64)) {
             return Err("unsupported video rate (requires 1..240 fps)".into());
         }
         Ok((n, d))
     };
-    let (num, den) = rate("r_frame_rate")?;
-    let (an, ad) = rate("avg_frame_rate")?;
-    if (num as f64 / den as f64 - an as f64 / ad as f64).abs() > 1e-6 {
-        return Err(
-            "variable frame rate is not supported for proxies; conform the source first".into(),
-        );
-    }
-    if number(s, "start_time")?.abs() > 0.0001 {
+    let (rnum, rden) = rate("r_frame_rate")?;
+    let (anum, aden) = rate("avg_frame_rate")?;
+    let vfr = (rnum as f64 / rden as f64 - anum as f64 / aden as f64).abs() > 1e-6;
+    if number(&s, "start_time")?.abs() > 0.0001 {
         return Err("proxy requires a video stream starting at zero".into());
     }
     if s["sample_aspect_ratio"]
@@ -221,41 +251,82 @@ pub fn inspect(path: &Path, timeout: Duration) -> Result<Video, String> {
     {
         return Err("proxy does not support rotated video or attached pictures".into());
     }
-    if ![
+    // Camera HDR (10-bit HLG/PQ -- every Pixel "HDR" clip) is proxied to 8-bit with the source's
+    // color tags re-declared, so previews still match the original's decode; everything else
+    // outside the historical 8-bit SDR set stays on originals, exactly as before. The proxy itself
+    // is 8-bit + HLG tags, so re-inspecting it passes this same rule.
+    let pix = s["pix_fmt"].as_str().unwrap_or("");
+    let trc = s["color_transfer"].as_str().unwrap_or("unknown");
+    let hdr = trc == "arib-std-b67" || trc == "smpte2084";
+    let pix_ok = [
         "yuv420p", "yuvj420p", "yuv422p", "yuvj422p", "yuv444p", "yuvj444p", "rgb24", "bgr24",
         "gbrp", "nv12",
     ]
-    .contains(&s["pix_fmt"].as_str().unwrap_or(""))
-        || s["color_transfer"].as_str().is_some_and(|x| {
-            ![
-                "unknown",
-                "bt709",
-                "iec61966-2-1",
-                "smpte170m",
-                "gamma22",
-                "gamma28",
-                "bt470m",
-                "bt470bg",
-            ]
-            .contains(&x)
-        })
-    {
+    .contains(&pix)
+        || (hdr && pix == "yuv420p10le");
+    let trc_ok = hdr
+        || [
+            "unknown",
+            "bt709",
+            "iec61966-2-1",
+            "smpte170m",
+            "gamma22",
+            "gamma28",
+            "bt470m",
+            "bt470bg",
+        ]
+        .contains(&trc);
+    if !pix_ok || !trc_ok {
         return Err(
-            "proxy supports opaque 8-bit SDR video only; alpha/HDR/float media stays on originals"
+            "proxy supports opaque 8-bit SDR and 10-bit HLG/PQ camera video only; alpha/float media stays on originals"
                 .into(),
         );
     }
-    let frames = data["frames"]
+    let color_tags = hdr.then(|| {
+        let g = |k: &str| s[k].as_str().unwrap_or("unknown").to_string();
+        (g("color_range"), g("color_space"), g("color_primaries"), g("color_transfer"))
+    });
+    // B-frame streams reorder packets, so only decoded frames give the presentation order there;
+    // a stream that does not report has_b_frames also takes the safe decoded path. Note the ffprobe
+    // quirk: -show_entries names sections in the singular (packet=/frame=) while the JSON output
+    // section is plural (packets/frames).
+    let (spec, section, key, threads) = match s["has_b_frames"].as_u64() {
+        Some(0) => ("packet", "packets", "pts_time", false),
+        _ => ("frame", "frames", "best_effort_timestamp_time", true),
+    };
+    let scan = probe(&format!("{spec}={key}"), threads)?[section]
         .as_array()
+        .cloned()
         .ok_or("video timestamps missing")?;
-    if frames.is_empty() || frames.len() > 216_000 {
+    if scan.is_empty() || scan.len() > 216_000 {
         return Err("proxy requires 1..216000 video frames".into());
     }
-    let dt = den as f64 / num as f64;
-    for (i, f) in frames.iter().enumerate() {
+    let mut ts = Vec::with_capacity(scan.len());
+    for f in &scan {
         crate::guard::check();
-        if (number(f, "best_effort_timestamp_time")? - i as f64 * dt).abs() > dt * 0.02 + 0.00001 {
-            return Err("nonuniform video timestamps: conform variable frame rate before generating proxies".into());
+        ts.push(number(f, key)?);
+    }
+    if vfr {
+        // VFR source: the renderer indexes frames by ordinal (media_index = time*fps -> decode
+        // position), so the proxy must preserve the frame SEQUENCE, which a passthrough encode
+        // does. What must still hold: timestamps strictly increase with no long stall (a sane,
+        // decodable stream) -- the ordinal contract's VFR counterpart of the CFR grid check.
+        let mut prev = -1.0f64;
+        for t in &ts {
+            if *t <= prev {
+                return Err("nonmonotonic video timestamps: this stream cannot be proxied".into());
+            }
+            if *t - prev > 1.0 {
+                return Err("video timestamps stall for over a second: this stream cannot be proxied".into());
+            }
+            prev = *t;
+        }
+    } else {
+        let dt = rden as f64 / rnum as f64;
+        for (i, t) in ts.iter().enumerate() {
+            if (t - i as f64 * dt).abs() > dt * 0.02 + 0.00001 {
+                return Err("nonuniform video timestamps: conform variable frame rate before generating proxies".into());
+            }
         }
     }
     let width = s["width"]
@@ -268,13 +339,31 @@ pub fn inspect(path: &Path, timeout: Duration) -> Result<Video, String> {
         .and_then(|n| u32::try_from(n).ok())
         .filter(|n| *n > 0)
         .ok_or("invalid video height")?;
+    let (num, den) = fit_rate(rnum, rden);
+    let (avg_num, avg_den) = fit_rate(anum, aden);
     Ok(Video {
         width,
         height,
         num,
         den,
-        frames: frames.len(),
+        frames: scan.len(),
+        avg_num,
+        avg_den,
+        vfr,
+        codec: s["codec_name"].as_str().unwrap_or("").to_string(),
+        color_tags,
     })
+}
+/// Reduce a rate rational by gcd so metadata rates fit u32 without changing the value.
+fn fit_rate(num: u64, den: u64) -> (u32, u32) {
+    let (mut a, mut b) = (num, den);
+    while b != 0 { (a, b) = (b, a % b); }
+    match (u32::try_from(num / a), u32::try_from(den / a)) {
+        (Ok(n), Ok(d)) => (n, d),
+        // A pathological timebase could still overflow u32 after reduction; keep the nearest
+        // representable value instead of failing the whole inspect over metadata.
+        _ => { let k = (num as f64 / den as f64).clamp(1.0, 240.0); (k.round() as u32, 1) }
+    }
 }
 pub fn dimensions(w: u32, h: u32, max_side: u32) -> Result<(u32, u32), String> {
     if w == 0 || h == 0 {
@@ -304,6 +393,17 @@ impl Drop for Temp {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
     }
+}
+
+/// Re-declare a 10-bit HDR source's color tags on its 8-bit proxy (range, matrix, primaries,
+/// transfer), skipping anything the source did not declare. Encoder-agnostic: NVENC and libx264
+/// both write these into the H.264 VUI, which ffprobe reads back, so the preview decode applies
+/// the same color interpretation as the original.
+pub(crate) fn color_args(cmd: &mut Command, t: &(String, String, String, String)) {
+    if t.0 != "unknown" { cmd.args(["-color_range", &t.0]); }
+    if t.1 != "unknown" { cmd.args(["-colorspace", &t.1]); }
+    if t.2 != "unknown" { cmd.args(["-color_primaries", &t.2]); }
+    if t.3 != "unknown" { cmd.args(["-color_trc", &t.3]); }
 }
 pub fn generate(
     p: &Project,
@@ -371,8 +471,17 @@ pub fn generate(
         .open(&tmp_path)
         .map_err(|e| e.to_string())?;
     let tmp = Temp(tmp_path);
+    // Hardware decode/encode when the GPU answers (hw.rs probes once per process). The software
+    // argv below is byte-identical to the pre-hw path, so with KIMO_HWACCEL=off, without an NVIDIA
+    // GPU, or whenever the hardware attempt fails, everything behaves exactly as before.
+    let hw_decode = crate::hw::nvdec_available() && (v.codec == "h264" || v.codec == "hevc");
+    let nvenc = crate::hw::nvenc_available();
     let mut cmd = Command::new("ffmpeg");
-    cmd.args(["-v", "error", "-nostdin", "-y", "-noautorotate", "-i"])
+    cmd.args(["-v", "error", "-nostdin", "-y"]);
+    if hw_decode {
+        cmd.args(["-hwaccel", "cuda"]);
+    }
+    cmd.args(["-noautorotate", "-i"])
         .arg(&source_path)
         .args([
             "-map",
@@ -384,34 +493,91 @@ pub fn generate(
             "-1",
             "-vf",
             &format!("scale={width}:{height}:flags=fast_bilinear,setsar=1"),
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "23",
-            "-g",
-            "1",
-            "-bf",
-            "0",
-            "-pix_fmt",
-            "yuv420p",
+        ]);
+    if nvenc {
+        // NVENC all-intra: gopLength 0 means every frame is an intra keyframe (SDK semantics).
+        // `-g 1` is rejected outright by SDK 12.2+ ("Gop Length should be greater than number of
+        // B frames + 1"), so the x264 `-g 1` literal cannot carry over.
+        cmd.args(["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "23", "-b:v", "0", "-g", "0", "-bf", "0"]);
+    } else {
+        cmd.args(["-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-g", "1", "-bf", "0"]);
+    }
+    cmd.arg("-pix_fmt").arg("yuv420p");
+    if let Some(t) = &v.color_tags { color_args(&mut cmd, t); }
+    if v.vfr {
+        // VFR source: keep every frame and its real timestamp (passthrough). The renderer maps
+        // time to frame ordinals, so the proxy must hold the same frame sequence -- a CFR
+        // resample would duplicate/drop frames and shift every later frame.
+        cmd.args(["-fps_mode", "passthrough", "-video_track_timescale", "90000"]);
+    } else {
+        cmd.args([
             "-r",
             &format!("{}/{}", v.num, v.den),
             "-fps_mode",
             "cfr",
             "-video_track_timescale",
             &v.num.to_string(),
-            "-f",
-            "mp4",
-        ])
-        .arg(&tmp.0);
-    crate::color::process::wait_command(&mut cmd, remaining())?;
+        ]);
+    }
+    cmd.args(["-f", "mp4"]).arg(&tmp.0);
+    let attempt = crate::color::process::wait_command(&mut cmd, remaining());
+    if attempt.is_err() && hw_decode {
+        // The hardware attempt failed (GPU busy, session limit, driver state): retry once,
+        // all-software. The temp file may hold a partial encode; -y rewrites it.
+        let mut cmd = Command::new("ffmpeg");
+        cmd.args(["-v", "error", "-nostdin", "-y", "-noautorotate", "-i"])
+            .arg(&source_path)
+            .args([
+                "-map",
+                "0:v:0",
+                "-an",
+                "-sn",
+                "-dn",
+                "-map_metadata",
+                "-1",
+                "-vf",
+                &format!("scale={width}:{height}:flags=fast_bilinear,setsar=1"),
+                "-c:v",
+                "libx264",
+                "-preset",
+                "veryfast",
+                "-crf",
+                "23",
+                "-g",
+                "1",
+                "-bf",
+                "0",
+                "-pix_fmt",
+                "yuv420p",
+            ]);
+        if let Some(t) = &v.color_tags { color_args(&mut cmd, t); }
+        if v.vfr {
+            cmd.args(["-fps_mode", "passthrough", "-video_track_timescale", "90000"]);
+        } else {
+            cmd.args([
+                "-r",
+                &format!("{}/{}", v.num, v.den),
+                "-fps_mode",
+                "cfr",
+                "-video_track_timescale",
+                &v.num.to_string(),
+            ]);
+        }
+        cmd.args(["-f", "mp4"]).arg(&tmp.0);
+        crate::color::process::wait_command(&mut cmd, remaining())?;
+    } else {
+        attempt?;
+    }
     let encoded = inspect(&tmp.0, remaining())?;
+    let rate_ok = if v.vfr {
+        (avg_fps(&encoded) - avg_fps(&v)).abs() <= avg_fps(&v) * 0.01 + 0.01
+    } else {
+        (encoded.num as f64 / encoded.den as f64 - v.num as f64 / v.den as f64).abs() <= 1e-6
+    };
     if encoded.frames != v.frames
         || encoded.width != width
         || encoded.height != height
-        || (encoded.num as f64 / encoded.den as f64 - v.num as f64 / v.den as f64).abs() > 1e-6
+        || !rate_ok
     {
         return Err("proxy failed frame-count/rate/dimension validation".into());
     }
@@ -424,6 +590,8 @@ pub fn generate(
     // Atomic, no-clobber publication. Neither errors nor cancellation attach a partial proxy.
     std::fs::hard_link(&tmp.0, &dest)
         .map_err(|e| format!("cannot publish proxy without overwriting: {e}"))?;
+    // Metadata rate: the honest average for VFR passthrough proxies, the CFR grid rate otherwise.
+    let (fps_num, fps_den) = if v.vfr { (v.avg_num, v.avg_den) } else { (v.num, v.den) };
     Ok(Proxy {
         path: dest.to_string_lossy().into_owned(),
         source,
@@ -432,8 +600,8 @@ pub fn generate(
         source_height: v.height,
         width,
         height,
-        fps_num: v.num,
-        fps_den: v.den,
+        fps_num,
+        fps_den,
         frames: v.frames,
     })
 }

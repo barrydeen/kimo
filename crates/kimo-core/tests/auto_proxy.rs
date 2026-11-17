@@ -210,3 +210,53 @@ fn light_media_is_skipped_and_reimport_reuses_the_job() {
     ff(&["-f", "lavfi", "-i", "color=c=red:s=64x36", "-frames:v", "1"], &png);
     assert!(call(&mut s, "import_media", json!({"path": png})).get("proxy").is_none());
 }
+
+/// Phone footage is VFR with timebase-shaped rate rationals (like 25110000/835459 on 4K Pixel
+/// HEVC). It used to be rejected outright ("variable frame rate is not supported"); now the edit
+/// proxy is a passthrough copy: same frame count, same timestamps, previews decode it.
+#[test]
+fn vfr_4k_source_gets_a_passthrough_edit_proxy_preserving_the_frame_sequence() {
+    let d = setup();
+    // 4K so the import is heavy; drop one frame and keep its real (uneven) timestamps.
+    let source = d.0.join("vfr-4k.mp4");
+    ff(
+        &[
+            "-f", "lavfi", "-i", "color=c=red:s=3840x2160:r=10:d=1",
+            "-vf", "select='not(eq(n,3))'", "-fps_mode", "vfr",
+            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+        ],
+        &source,
+    );
+    let src = source.to_str().unwrap();
+    let v = kimo_core::proxy::inspect(Path::new(src), Duration::from_secs(60)).unwrap();
+    assert!(v.vfr, "fixture must really be VFR: {v:?}");
+    let frames = v.frames;
+
+    let mut s = session(640, 360);
+    let r = call(&mut s, "import_media", json!({"path": source}));
+    let id = r["asset_id"].as_str().unwrap().to_string();
+    assert_eq!(r["proxy"]["state"], "queued", "{r}");
+    assert_eq!(r["proxy"]["reasons"], json!(["4k"]), "{r}");
+    assert!(auto_proxy::wait_idle(Duration::from_secs(300)), "proxy build did not finish");
+    let j = job(&mut s, &id);
+    assert_eq!(j["state"], "ready", "{j}");
+    assert!(j["analysis_proxy"].is_null(), "short-GOP media needs no analysis proxy: {j}");
+    let edit = j["edit_proxy"].as_str().expect("edit proxy path").to_string();
+    assert_eq!(probe_size(&edit), (1280, 720));
+
+    // The proxy holds the same frames in the same order with VFR timing: the sequence a CFR
+    // resample would have shifted. This is the whole reason for the passthrough branch.
+    let pv = kimo_core::proxy::inspect(Path::new(&edit), Duration::from_secs(60)).unwrap();
+    assert_eq!(pv.frames, frames, "every frame survives: {pv:?}");
+    assert!(pv.vfr, "passthrough keeps the VFR timing: {pv:?}");
+    assert!(
+        (kimo_core::proxy::avg_fps(&pv) - kimo_core::proxy::avg_fps(&v)).abs()
+            <= kimo_core::proxy::avg_fps(&v) * 0.01 + 0.01,
+        "{pv:?}"
+    );
+
+    // previews decode the proxy
+    add_clip(&mut s, &id, 1.0);
+    let png = d.0.join("f.png");
+    assert_eq!(call(&mut s, "render_frame", json!({"time": 0.2, "path": png}))["proxy_assets"], json!([id]));
+}

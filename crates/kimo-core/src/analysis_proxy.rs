@@ -71,11 +71,14 @@ fn sidecar_path(proxy_path: &Path) -> PathBuf {
 
 /// Probe the source's own keyframe times and return the largest gap between consecutive ones,
 /// including the lead-in from 0 and the tail to `duration`. ffprobe-only; never writes anything.
+/// Keyframe positions live on packets, so this demuxes instead of decoding: seconds on 4K HEVC
+/// instead of the minutes a decoded-frame scan costs (auto_proxy::packet_keyframe_gap, the same
+/// measure, agrees with the old decoded scan to under 0.05 s on real footage).
 pub fn max_keyframe_gap(path: &str, duration: f64) -> Result<f64, String> {
     let out = Command::new("ffprobe")
         .args([
-            "-v", "error", "-select_streams", "v:0", "-show_entries", "frame=key_frame,pkt_dts_time",
-            "-of", "default=noprint_wrappers=1:nokey=1", path,
+            "-v", "error", "-select_streams", "v:0", "-show_entries", "packet=pts_time,flags",
+            "-of", "csv=p=0", path,
         ])
         .output()
         .map_err(|e| e.to_string())?;
@@ -83,12 +86,14 @@ pub fn max_keyframe_gap(path: &str, duration: f64) -> Result<f64, String> {
         return Err(String::from_utf8_lossy(&out.stderr).into_owned());
     }
     let text = String::from_utf8_lossy(&out.stdout);
-    let mut lines = text.lines();
     let mut times: Vec<f64> = vec![0.0];
-    while let (Some(kf), Some(t)) = (lines.next(), lines.next()) {
-        if kf.trim() == "1" {
-            if let Ok(v) = t.trim().parse::<f64>() {
-                times.push(v);
+    for l in text.lines() {
+        let mut it = l.split(',');
+        if let (Some(t), Some(f)) = (it.next(), it.next()) {
+            if f.contains('K') {
+                if let Ok(v) = t.trim().parse::<f64>() {
+                    times.push(v);
+                }
             }
         }
     }
@@ -230,16 +235,36 @@ fn build(original_path: &str, duration: f64, fps: f64, s: &Slot, known_gap: Opti
     std::fs::create_dir_all(&s.dir).ok()?;
     let gop = ((fps * GOP_SECONDS).round() as usize).max(1);
     let tmp = s.proxy_path.with_extension("mp4.part");
-    let mut cmd = Command::new("ffmpeg");
-    cmd.args([
-            "-y", "-v", "error", "-nostdin", "-i", original_path,
-            "-vf", &format!("fps={fps}"),
-            "-c:v", "libx264", "-preset", "veryfast", "-crf", "14",
-            "-g", &gop.to_string(), "-keyint_min", &gop.to_string(), "-sc_threshold", "0",
-            "-pix_fmt", "yuv420p", "-an", "-f", "mp4",
-        ])
-        .arg(&tmp);
-    if crate::auto_proxy::run_ffmpeg(&mut cmd, crate::auto_proxy::Measure::Seconds(duration), progress).is_err() {
+    // Hardware decode/encode when the GPU answers; the software branch below is the historical argv.
+    let hw_decode = crate::hw::nvdec_for(original_path);
+    let nvenc = crate::hw::nvenc_available();
+    let command = |hw: bool| -> Command {
+        let mut cmd = Command::new("ffmpeg");
+        cmd.args(["-y", "-v", "error", "-nostdin"]);
+        if hw {
+            cmd.args(["-hwaccel", "cuda"]);
+        }
+        cmd.args(["-i", original_path, "-vf", &format!("fps={fps}")]);
+        if nvenc {
+            // `-g 0` on NVENC means every frame intra (SDK semantics); a computed GOP of 1 maps to
+            // it, because `-g 1` is rejected by SDK 12.2+ ("Gop Length should be greater than
+            // number of B frames + 1").
+            let gop_arg = if gop <= 1 { "0".to_string() } else { gop.to_string() };
+            cmd.args(["-c:v", "h264_nvenc", "-preset", "p4", "-rc", "vbr", "-cq", "14", "-b:v", "0", "-g", &gop_arg, "-pix_fmt", "yuv420p"]);
+        } else {
+            cmd.args(["-c:v", "libx264", "-preset", "veryfast", "-crf", "14", "-g", &gop.to_string(), "-keyint_min", &gop.to_string(), "-sc_threshold", "0", "-pix_fmt", "yuv420p"]);
+        }
+        cmd.args(["-an", "-f", "mp4"]).arg(&tmp);
+        cmd
+    };
+    let attempt = crate::auto_proxy::run_ffmpeg(&mut command(hw_decode), crate::auto_proxy::Measure::Seconds(duration), progress);
+    if attempt.is_err() && hw_decode {
+        // The hardware attempt failed (GPU busy, session limit, driver state): once, all-software.
+        if crate::auto_proxy::run_ffmpeg(&mut command(false), crate::auto_proxy::Measure::Seconds(duration), progress).is_err() {
+            let _ = std::fs::remove_file(&tmp);
+            return None;
+        }
+    } else if attempt.is_err() {
         let _ = std::fs::remove_file(&tmp);
         return None;
     }

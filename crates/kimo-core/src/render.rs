@@ -424,7 +424,13 @@ fn decode(p: &Project, c: &Clip, path: &str, a: usize, n: usize, seek_base: Opti
     crate::guard::reserve(estimate);
     let exr_args:Vec<&str>=if path.to_lowercase().ends_with(".exr"){vec!["-apply_trc","linear"]}else{vec![]};
     let vf=if native_fit{format!("setpts=PTS/{},{},trim=start_frame={a_rel}:end_frame={},setpts=PTS-STARTPTS,format={pix}",speed.max(0.01),fps_filter,a_rel+n)}else{vf};
-    let mut command=Command::new("ffmpeg");command.args(["-v","error"]).args(&loop_args).args(&exr_args).args(["-ss",&format!("{in_pt}"),"-t",&format!("{span}"),"-i",path,"-vf",&vf,"-frames:v",&n.max(1).to_string(),"-f","rawvideo","-pix_fmt",pix,"-"]);
+    let mut command=Command::new("ffmpeg");command.args(["-v","error"]).args(&loop_args).args(&exr_args);
+    // NVDEC when this source's codec is one the GPU decodes (h264/hevc; hw.rs probes and caches).
+    // `-hwaccel cuda` only changes which decoder runs; filters, timestamps and pixel format all
+    // stay in system memory exactly as before, so decoded bytes are the codec-spec-equivalent
+    // output a software decode produces too.
+    if crate::hw::nvdec_for(path){command.args(["-hwaccel","cuda"]);}
+    command.args(["-ss",&format!("{in_pt}"),"-t",&format!("{span}"),"-i",path,"-vf",&vf,"-frames:v",&n.max(1).to_string(),"-f","rawvideo","-pix_fmt",pix,"-"]);
     let mut buf=Vec::new();
     let linear_buf=if native_fit{
         let bytes_per_frame=raw_fs.checked_mul(if float_source{4}else{2}).ok_or("native frame size overflow")?;
@@ -1286,13 +1292,30 @@ pub(crate) fn legacy_encoder_command_opts(p:&Project,path:&str,crf:u32,low_memor
     // bytes unaffected, only the metadata was wrong. The color_pipeline-enabled explicit branch is untouched
     // (a caller who explicitly asked for output_transfer=1 still gets the literal sRGB tag they requested).
     let transfer=if q.enabled{q.validate()?;if q.output_gamut!=0{return Err("ordinary video export requires Rec709 output gamut=0; select a supported delivery output or export_high_bit".into())}match q.output_transfer{0=>"linear",1=>"iec61966-2-1",8=>"bt709",_=>return Err("ordinary video export requires exactly taggable linear/sRGB/BT709 output transfer; select a supported delivery output or export_high_bit".into())}}else{"bt709"};
-    let mut cmd=Command::new("ffmpeg");cmd.args(["-v","error","-y","-f","rawvideo","-pix_fmt","rgba","-s",&format!("{}x{}",p.width,p.height),"-r",&p.fps.to_string(),"-i","-","-c:v","libx264"]);
-    // V8.8.0 (audit #1): an explicit x264 preset. Measured at crf 18 on real footage: "slow" is both
-    // smaller AND higher-SSIM than ffmpeg's own unset default ("medium"); see CHANGELOG.md v8.8.0 for the
-    // numbers. None (every project before this version, and any caller that never sets it) adds no
-    // `-preset` flag at all, so ffmpeg picks its own default and the argv is byte-identical to before.
-    if let Some(preset)=&p.x264_preset{cmd.args(["-preset",preset]);}
-    cmd.args(["-vf","scale=out_color_matrix=bt709:out_range=tv","-pix_fmt","yuv420p","-color_range","tv","-color_primaries","bt709","-color_trc",transfer,"-colorspace","bt709","-crf",&crf.to_string()]);if low_memory{cmd.args(["-x264-params","rc-lookahead=10:ref=2:bframes=2:sync-lookahead=0"]);}cmd.arg(path);Ok(cmd)
+    // KIMO_ENCODER (default: unset = software libx264, byte-identical argv to before): "nvenc" encodes
+    // the video stream with h264_nvenc on the machine's NVIDIA GPU when one answers a real encode
+    // probe (hw.rs). Same color tags, same scale; only the encoder block changes. An unavailable GPU
+    // falls back to the software path with a one-line note (an export never fails over hardware).
+    let requested_nvenc=matches!(std::env::var("KIMO_ENCODER").unwrap_or_default().to_ascii_lowercase().as_str(),"nvenc"|"gpu"|"hw");
+    let nvenc=requested_nvenc&&crate::hw::nvenc_available();
+    if requested_nvenc&&!nvenc{static W:std::sync::OnceLock<()>=std::sync::OnceLock::new();W.get_or_init(||{eprintln!("KIMO_ENCODER=nvenc requested, but no usable NVENC encoder answered the probe (KIMO_HWACCEL or driver state) -- using libx264.");});}
+    let mut cmd=Command::new("ffmpeg");cmd.args(["-v","error","-y","-f","rawvideo","-pix_fmt","rgba","-s",&format!("{}x{}",p.width,p.height),"-r",&p.fps.to_string(),"-i","-"]);
+    if nvenc{
+        // x264 preset names do not exist on nvenc; the documented ones map to the closest p-rate.
+        let pnum=match p.x264_preset.as_deref(){Some("ultrafast")=>1,Some("superfast")|Some("veryfast")=>2,Some("faster")|Some("fast")=>3,Some("slow")=>5,Some("slower")|Some("veryslow")=>6,_=>4};
+        cmd.args(["-c:v","h264_nvenc","-preset",&format!("p{pnum}"),"-tune","hq","-rc","vbr","-cq",&crf.to_string(),"-b:v","0"]);
+    }else{
+        cmd.args(["-c:v","libx264"]);
+        // V8.8.0 (audit #1): an explicit x264 preset. Measured at crf 18 on real footage: "slow" is both
+        // smaller AND higher-SSIM than ffmpeg's own unset default ("medium"); see CHANGELOG.md v8.8.0 for the
+        // numbers. None (every project before this version, and any caller that never sets it) adds no
+        // `-preset` flag at all, so ffmpeg picks its own default and the argv is byte-identical to before.
+        if let Some(preset)=&p.x264_preset{cmd.args(["-preset",preset]);}
+    }
+    cmd.args(["-vf","scale=out_color_matrix=bt709:out_range=tv","-pix_fmt","yuv420p","-color_range","tv","-color_primaries","bt709","-color_trc",transfer,"-colorspace","bt709"]);
+    if !nvenc{cmd.arg("-crf").arg(crf.to_string());}
+    if low_memory&&!nvenc{cmd.args(["-x264-params","rc-lookahead=10:ref=2:bframes=2:sync-lookahead=0"]);}
+    cmd.arg(path);Ok(cmd)
 }
 
 
@@ -1713,11 +1736,39 @@ fn flow_pair(fr:&Frames,a:usize,b:usize,w:usize,h:usize)->Result<(Frame,Frame),S
 #[cfg(test)]mod decode_lifecycle_test{use super::*;
 #[test]fn decoder_reaped_on_unwind(){let mut id=0;let r=std::panic::catch_unwind(std::panic::AssertUnwindSafe(||{let child=Command::new("sleep").arg("30").spawn().unwrap();id=child.id();let _decoder=DecodeProcess(child);panic!("test cancelled decode");}));assert!(r.is_err());assert!(!std::path::Path::new(&format!("/proc/{id}")).exists());}
 }
+// The tests below read process-global state (KIMO_ENCODER, hw.rs probe overrides, KIMO_HWACCEL),
+// so they serialize on one mutex: a parallel golden never observes another test's flip mid-assert.
+#[cfg(test)]
+pub(crate) static ENCODER_STATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+#[cfg(test)]
+pub(crate) fn encoder_state() -> std::sync::MutexGuard<'static, ()> {
+    ENCODER_STATE.lock().unwrap_or_else(|e| e.into_inner())
+}
 #[cfg(test)]mod legacy_encoder_tests{use super::*;
-#[test]fn ordinary_video_argv_declares_matching_conversion_and_tags(){for(w,h)in[(320,180),(1280,720)]{let mut p=Project::default();p.width=w;p.height=h;p.fps=25.;let cmd=legacy_encoder_command(&p,"proof.mp4",23).unwrap();let logged:Vec<_>=cmd.get_args().map(|v|v.to_string_lossy().to_string()).collect();assert_eq!(logged,vec!["-v","error","-y","-f","rawvideo","-pix_fmt","rgba","-s",&format!("{w}x{h}"),"-r","25","-i","-","-c:v","libx264","-vf","scale=out_color_matrix=bt709:out_range=tv","-pix_fmt","yuv420p","-color_range","tv","-color_primaries","bt709","-color_trc","bt709","-colorspace","bt709","-crf","23","proof.mp4"]);}}
-#[test]fn x264_preset_appears_in_argv_when_set(){let mut p=Project::default();p.width=320;p.height=180;p.fps=25.;p.x264_preset=Some("slow".into());let cmd=legacy_encoder_command(&p,"proof.mp4",23).unwrap();let args:Vec<_>=cmd.get_args().map(|v|v.to_string_lossy().to_string()).collect();assert!(args.windows(2).any(|w|w==["-preset","slow"]),"expected -preset slow: {args:?}");}
-#[test]fn x264_preset_none_is_byte_identical_to_before(){let mut p=Project::default();p.width=320;p.height=180;p.fps=25.;let cmd=legacy_encoder_command(&p,"proof.mp4",23).unwrap();let args:Vec<_>=cmd.get_args().map(|v|v.to_string_lossy().to_string()).collect();assert!(!args.iter().any(|a|a=="-preset"));assert_eq!(args,vec!["-v","error","-y","-f","rawvideo","-pix_fmt","rgba","-s","320x180","-r","25","-i","-","-c:v","libx264","-vf","scale=out_color_matrix=bt709:out_range=tv","-pix_fmt","yuv420p","-color_range","tv","-color_primaries","bt709","-color_trc","bt709","-colorspace","bt709","-crf","23","proof.mp4"]);}
-#[test]fn ordinary_video_rejects_untaggable_output_before_spawn(){let mut p=Project::default();p.color_pipeline.enabled=true;for g in 1..=7{p.color_pipeline.output_gamut=g;assert!(legacy_encoder_command(&p,"unused.mp4",18).is_err())}p.color_pipeline.output_gamut=0;for t in[2,3,4,5,6,7]{p.color_pipeline.output_transfer=t;assert!(legacy_encoder_command(&p,"unused.mp4",18).is_err())}for(t,name)in[(0,"linear"),(1,"iec61966-2-1"),(8,"bt709")]{p.color_pipeline.output_transfer=t;let cmd=legacy_encoder_command(&p,"unused.mp4",18).unwrap();let args:Vec<_>=cmd.get_args().map(|v|v.to_string_lossy().to_string()).collect();assert!(args.windows(2).any(|v|v==["-color_trc",name]));}}
+#[test]fn ordinary_video_argv_declares_matching_conversion_and_tags(){let _g=encoder_state();for(w,h)in[(320,180),(1280,720)]{let mut p=Project::default();p.width=w;p.height=h;p.fps=25.;let cmd=legacy_encoder_command(&p,"proof.mp4",23).unwrap();let logged:Vec<_>=cmd.get_args().map(|v|v.to_string_lossy().to_string()).collect();assert_eq!(logged,vec!["-v","error","-y","-f","rawvideo","-pix_fmt","rgba","-s",&format!("{w}x{h}"),"-r","25","-i","-","-c:v","libx264","-vf","scale=out_color_matrix=bt709:out_range=tv","-pix_fmt","yuv420p","-color_range","tv","-color_primaries","bt709","-color_trc","bt709","-colorspace","bt709","-crf","23","proof.mp4"]);}}
+#[test]fn x264_preset_appears_in_argv_when_set(){let _g=encoder_state();let mut p=Project::default();p.width=320;p.height=180;p.fps=25.;p.x264_preset=Some("slow".into());let cmd=legacy_encoder_command(&p,"proof.mp4",23).unwrap();let args:Vec<_>=cmd.get_args().map(|v|v.to_string_lossy().to_string()).collect();assert!(args.windows(2).any(|w|w==["-preset","slow"]),"expected -preset slow: {args:?}");}
+#[test]fn x264_preset_none_is_byte_identical_to_before(){let _g=encoder_state();let mut p=Project::default();p.width=320;p.height=180;p.fps=25.;let cmd=legacy_encoder_command(&p,"proof.mp4",23).unwrap();let args:Vec<_>=cmd.get_args().map(|v|v.to_string_lossy().to_string()).collect();assert!(!args.iter().any(|a|a=="-preset"));assert_eq!(args,vec!["-v","error","-y","-f","rawvideo","-pix_fmt","rgba","-s","320x180","-r","25","-i","-","-c:v","libx264","-vf","scale=out_color_matrix=bt709:out_range=tv","-pix_fmt","yuv420p","-color_range","tv","-color_primaries","bt709","-color_trc","bt709","-colorspace","bt709","-crf","23","proof.mp4"]);}
+#[test]fn ordinary_video_rejects_untaggable_output_before_spawn(){let _g=encoder_state();let mut p=Project::default();p.color_pipeline.enabled=true;for g in 1..=7{p.color_pipeline.output_gamut=g;assert!(legacy_encoder_command(&p,"unused.mp4",18).is_err())}p.color_pipeline.output_gamut=0;for t in[2,3,4,5,6,7]{p.color_pipeline.output_transfer=t;assert!(legacy_encoder_command(&p,"unused.mp4",18).is_err())}for(t,name)in[(0,"linear"),(1,"iec61966-2-1"),(8,"bt709")]{p.color_pipeline.output_transfer=t;let cmd=legacy_encoder_command(&p,"unused.mp4",18).unwrap();let args:Vec<_>=cmd.get_args().map(|v|v.to_string_lossy().to_string()).collect();assert!(args.windows(2).any(|v|v==["-color_trc",name]));}}
+// KIMO_ENCODER drives only the encoder block; one sequential test (env vars are process-global, so
+// parallel cases would race) covers unset/nvenc-available/nvenc-unavailable/explicit-x264. The
+// historical argv asserts use the hardware override so the result never depends on this machine.
+#[test]fn kimo_encoder_switches_only_the_encoder_block(){let _g=encoder_state();fn args(p:&Project)->Vec<String>{legacy_encoder_command(p,"proof.mp4",23).unwrap().get_args().map(|v|v.to_string_lossy().to_string()).collect()}
+    let historical=vec!["-v","error","-y","-f","rawvideo","-pix_fmt","rgba","-s","320x180","-r","25","-i","-","-c:v","libx264","-vf","scale=out_color_matrix=bt709:out_range=tv","-pix_fmt","yuv420p","-color_range","tv","-color_primaries","bt709","-color_trc","bt709","-colorspace","bt709","-crf","23","proof.mp4"];
+    let mut p=Project::default();p.width=320;p.height=180;p.fps=25.;
+    std::env::remove_var("KIMO_ENCODER");
+    crate::hw::set_probe_override(Some((true,true)));
+    assert_eq!(args(&p),historical,"unset KIMO_ENCODER stays byte-identical even when NVENC exists");
+    std::env::set_var("KIMO_ENCODER","nvenc");
+    let a=args(&p);assert!(a.windows(2).any(|w|w==["-c:v","h264_nvenc"]),"{a:?}");assert!(a.windows(2).any(|w|w==["-rc","vbr"]),"{a:?}");assert!(a.windows(2).any(|w|w==["-cq","23"]),"{a:?}");assert!(a.windows(2).any(|w|w==["-b:v","0"]),"{a:?}");assert!(!a.iter().any(|x|x=="-crf"),"-crf is an x264 option: {a:?}");assert!(a.windows(2).any(|w|w==["-color_trc","bt709"])&&a.windows(2).any(|w|w==["-colorspace","bt709"]),"color tags unchanged: {a:?}");
+    let mut preset=p.clone();preset.x264_preset=Some("slow".into());let a=args(&preset);assert!(a.windows(2).any(|w|w==["-preset","p5"]),"x264 preset names map to nvenc p-rates: {a:?}");
+    crate::hw::set_probe_override(Some((false,false)));
+    assert_eq!(args(&p),historical,"nvenc requested but unavailable falls back to the exact software argv");
+    std::env::set_var("KIMO_ENCODER","x264");
+    crate::hw::set_probe_override(Some((true,true)));
+    assert_eq!(args(&p),historical,"KIMO_ENCODER=x264 is the explicit software path");
+    std::env::remove_var("KIMO_ENCODER");
+    crate::hw::set_probe_override(None);
+}
 #[cfg(test)]
 mod transfer_tag_tests {
     use super::*;
@@ -1728,6 +1779,7 @@ mod transfer_tag_tests {
     // though legacy_encoder_command never applies the sRGB OETF -- a mistagged, not miscoded, HD delivery.
     #[test]
     fn exported_mp4_is_ffprobe_tagged_bt709_transfer_primaries_colorspace_tv_range() {
+        let _g = encoder_state();
         let mut ss = Session::new();
         dispatch(&mut ss, "project_set", &json!({"width":64,"height":64,"fps":25})).unwrap();
         let track = dispatch(&mut ss, "add_track", &json!({})).unwrap()["track_id"].as_str().unwrap().to_string();
@@ -1805,6 +1857,7 @@ fn static_layer(p: &Project, c: &Clip, lt: f64, seed: u64, t: f64, cache: &Cache
     Ok(Some(f))
 }
 #[test] fn low_memory_changes_only_the_x264_params() {
+    let _g = encoder_state();
     let mut p = Project::default(); p.width = 1280; p.height = 720; p.fps = 25.;
     let args = |c: &Command| -> Vec<String> { c.get_args().map(|v| v.to_string_lossy().to_string()).collect() };
     let (d, d2) = (legacy_encoder_command(&p, "o.mp4", 23).unwrap(), legacy_encoder_command_opts(&p, "o.mp4", 23, false).unwrap());
