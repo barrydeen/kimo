@@ -769,7 +769,21 @@ fn bridge_handler(app: tauri::AppHandle) -> bridge::Handler {
     })
 }
 
+/// NVIDIA + Wayland: webkit2gtk's DMABUF renderer dies at startup with a Wayland protocol error
+/// ("Error 71 dispatching to Wayland display"), seen live on this machine (RTX 3090s + Hyprland).
+/// webkit reads this switch before GTK initializes, so it is set here, before the builder runs.
+/// Only when a Wayland session is active and the NVIDIA driver is loaded; an explicit user value
+/// always wins.
+fn webkit_nvidia_wayland_workaround() {
+    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_some() { return; }
+    let wayland = std::env::var_os("WAYLAND_DISPLAY").map(|v| !v.is_empty()).unwrap_or(false);
+    if !wayland { return; }
+    if !Path::new("/proc/driver/nvidia/version").exists() { return; }
+    std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+}
+
 fn main() {
+    webkit_nvidia_wayland_workaround();
     let argv: Vec<String> = std::env::args().skip(1).collect();
     if argv.first().map(|a| a == "mcp").unwrap_or(false) { run_mcp(&argv[1..]); }
     if argv.first().map(|a| a == "--version").unwrap_or(false) { println!("kimo-gui {}", env!("CARGO_PKG_VERSION")); return; }
